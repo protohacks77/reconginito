@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Camera, AlertCircle, Zap, Loader2 } from 'lucide-react';
 
+// Import TensorFlow.js
+import * as tf from '@tensorflow/tfjs';
+
 interface Detection {
   id: string;
   timestamp: number;
@@ -19,16 +22,23 @@ interface DetectedObject {
   bbox: [number, number, number, number];
 }
 
+// Add a specific type for the COCO-SSD model
+interface ObjectDetectionModel {
+  detect: (source: HTMLVideoElement) => Promise<DetectedObject[]>;
+}
+
 declare global {
   interface Window {
-    cocoSsd: any;
+    cocoSsd: {
+      load: () => Promise<ObjectDetectionModel>;
+    };
   }
 }
 
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [model, setModel] = useState<any>(null);
+  const [model, setModel] = useState<ObjectDetectionModel | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string>('');
   const [detections, setDetections] = useState<Detection[]>([]);
@@ -36,7 +46,6 @@ function App() {
   const [currentObjects, setCurrentObjects] = useState<string[]>([]);
   const lastDetectionTime = useRef<Map<string, number>>(new Map());
   const animationFrameId = useRef<number>();
-  const detectionIntervalRef = useRef<NodeJS.Timeout>();
 
   // Generate AI explanation for detected objects
   const generateExplanation = useCallback((objects: Array<{ label: string; confidence: number }>) => {
@@ -70,7 +79,7 @@ function App() {
       return `${desc} (Confidence: ${(obj.confidence * 100).toFixed(1)}%)`;
     } else {
       const labels = objects.map(o => o.label).join(', ');
-      return `Multiple objects detected: ${labels}. The AI vision system has identified ${objects.length} distinct objects in this frame.`;
+      return `Multiple objects detected: ${labels}. The Recognito has identified ${objects.length} distinct objects in this frame.`;
     }
   }, []);
 
@@ -100,38 +109,35 @@ function App() {
     const loadModel = async () => {
       try {
         setIsLoading(true);
+        // Force TensorFlow.js to use the CPU backend
+        await tf.setBackend('cpu');
 
         if (window.cocoSsd) {
           const loadedModel = await window.cocoSsd.load();
           setModel(loadedModel);
           await initCamera();
-          setIsLoading(false);
         } else {
-          setTimeout(() => {
-            if (window.cocoSsd) {
-              loadModel();
-            } else {
-              setError('TensorFlow.js COCO-SSD failed to load. Please refresh the page.');
-            }
-          }, 1000);
+          // Retry if the script hasn't loaded yet
+          setTimeout(loadModel, 500);
         }
       } catch (err) {
         setError('Failed to initialize the detection system. Please refresh the page.');
         console.error('Model loading error:', err);
+      } finally {
+        setIsLoading(false);
       }
     };
 
     loadModel();
 
+    const videoEl = videoRef.current;
+
     return () => {
       if (animationFrameId.current) {
         cancelAnimationFrame(animationFrameId.current);
       }
-      if (detectionIntervalRef.current) {
-        clearInterval(detectionIntervalRef.current);
-      }
-      if (videoRef.current?.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
+      if (videoEl?.srcObject) {
+        const stream = videoEl.srcObject as MediaStream;
         stream.getTracks().forEach(track => track.stop());
       }
     };
@@ -305,9 +311,9 @@ function App() {
             </div>
             <div>
               <h1 className="text-2xl font-bold bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
-                AI Vision
+                Recognito
               </h1>
-              <p className="text-xs text-gray-400">Real-time Object Recognition</p>
+              <p className="text-xs text-gray-400">AI-Powered Object Recognition</p>
             </div>
           </div>
 
@@ -333,7 +339,7 @@ function App() {
         <div className="fixed inset-0 flex items-center justify-center bg-black/50 backdrop-blur-sm z-50">
           <div className="text-center">
             <Loader2 className="w-16 h-16 text-cyan-400 animate-spin mx-auto mb-4" />
-            <p className="text-xl font-medium">Initializing AI Vision System...</p>
+            <p className="text-xl font-medium">Initializing Recognito...</p>
             <p className="text-gray-400 mt-2">Loading neural network models</p>
           </div>
         </div>
