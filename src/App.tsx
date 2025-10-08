@@ -13,14 +13,6 @@ interface ObjectDetectionModel {
   detect: (source: HTMLVideoElement) => Promise<DetectedObject[]>;
 }
 
-declare global {
-  interface Window {
-    cocoSsd: {
-      load: () => Promise<ObjectDetectionModel>;
-    };
-    tf: any;
-  }
-}
 
 // Type for a detected human event
 interface DetectedHuman {
@@ -101,10 +93,12 @@ function App() {
 
     checkForLibs();
 
+    const videoEl = videoRef.current;
+
     return () => {
       if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
-      if (videoRef.current?.srcObject) {
-        (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
+      if (videoEl?.srcObject) {
+        (videoEl.srcObject as MediaStream).getTracks().forEach(track => track.stop());
       }
     };
   }, [initCamera]);
