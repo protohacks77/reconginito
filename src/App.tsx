@@ -1,481 +1,301 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { Camera, AlertCircle, Zap, Loader2 } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Eye, Users, CheckCircle2, Loader2, AlertCircle, VideoOff } from 'lucide-react';
+import { generateClothingDescription } from './lib/gemini';
 
-interface Detection {
-  id: string;
-  timestamp: number;
-  objects: Array<{
-    label: string;
-    confidence: number;
-    bbox: number[];
-  }>;
-  imageData: string;
-  explanation: string;
-}
-
+// Type definitions for object detection
 interface DetectedObject {
   class: string;
   score: number;
   bbox: [number, number, number, number];
 }
 
-declare global {
-  interface Window {
-    cocoSsd: any;
-  }
+interface ObjectDetectionModel {
+  detect: (source: HTMLVideoElement) => Promise<DetectedObject[]>;
+}
+
+
+// Type for a detected human event
+interface DetectedHuman {
+  id: string;
+  timestamp: string;
+  imageData: string; // Base64 encoded image
+  description: string;
+  isProcessing: boolean;
 }
 
 function App() {
+  const [isLiveFeedVisible, setIsLiveFeedVisible] = useState(false);
+  const [detectedHumans, setDetectedHumans] = useState<DetectedHuman[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadingMessage, setLoadingMessage] = useState('Initializing Recognito...');
+  const [error, setError] = useState<string>('');
+  const [model, setModel] = useState<ObjectDetectionModel | null>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [model, setModel] = useState<any>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string>('');
-  const [detections, setDetections] = useState<Detection[]>([]);
-  const [isDetecting, setIsDetecting] = useState(false);
-  const [currentObjects, setCurrentObjects] = useState<string[]>([]);
-  const lastDetectionTime = useRef<Map<string, number>>(new Map());
+  const lastDetectionTime = useRef<number>(0);
   const animationFrameId = useRef<number>();
-  const detectionIntervalRef = useRef<NodeJS.Timeout>();
 
-  // Generate AI explanation for detected objects
-  const generateExplanation = useCallback((objects: Array<{ label: string; confidence: number }>) => {
-    const objectDescriptions: Record<string, string> = {
-      person: 'A human being detected in the frame. Humans are bipedal primates known for their advanced cognitive abilities.',
-      laptop: 'A portable computer designed for mobile use, featuring an integrated display and keyboard.',
-      'cell phone': 'A mobile communication device with computing capabilities, essential for modern connectivity.',
-      book: 'A written or printed work consisting of pages, used for recording information or stories.',
-      chair: 'A piece of furniture designed for sitting, typically featuring a backrest and four legs.',
-      cup: 'A container used for holding beverages, essential for daily hydration and refreshment.',
-      bottle: 'A rigid container typically used for storing liquids, designed with a narrow neck.',
-      keyboard: 'An input device featuring keys for typing, essential for computer interaction.',
-      mouse: 'A pointing device used to interact with computer interfaces through cursor control.',
-      monitor: 'A display screen for computers, showing visual output from the system.',
-      backpack: 'A bag carried on the back with straps, used for transporting personal items.',
-      car: 'A wheeled motor vehicle designed for transportation on roads.',
-      dog: 'A domesticated carnivorous mammal, known as humans best companion animal.',
-      cat: 'A small domesticated feline, popular as a pet for its independence and affection.',
-      clock: 'A device for measuring and displaying time, essential for scheduling and time management.',
-      vase: 'A decorative container typically used for displaying flowers.',
-      scissors: 'A cutting instrument with two blades, used for various cutting tasks.',
-      teddy_bear: 'A stuffed toy bear, often given as a gift or comfort item.',
-      plant: 'A living organism that typically produces oxygen through photosynthesis.',
-      tv: 'A television set for displaying broadcast content and entertainment media.'
-    };
-
-    if (objects.length === 1) {
-      const obj = objects[0];
-      const desc = objectDescriptions[obj.label.toLowerCase()] ||
-        `A ${obj.label} has been detected in the scene.`;
-      return `${desc} (Confidence: ${(obj.confidence * 100).toFixed(1)}%)`;
-    } else {
-      const labels = objects.map(o => o.label).join(', ');
-      return `Multiple objects detected: ${labels}. The AI vision system has identified ${objects.length} distinct objects in this frame.`;
-    }
-  }, []);
-
-  // Initialize camera
   const initCamera = useCallback(async () => {
     try {
+      setLoadingMessage('Accessing camera...');
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
       });
-
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.onloadedmetadata = () => {
-          videoRef.current?.play().catch(err => {
-            console.error('Video play error:', err);
-          });
-        };
+        await new Promise((resolve) => {
+          if (videoRef.current) {
+            videoRef.current.onloadedmetadata = () => {
+              videoRef.current?.play().catch(err => {
+                console.error("Video play error:", err);
+                setError("Failed to play video stream.");
+              });
+              resolve(null);
+            };
+          }
+        });
       }
     } catch (err) {
-      setError('Camera access denied. Please grant camera permissions to use this app.');
       console.error('Camera error:', err);
+      setError('Camera access denied. Please grant camera permissions to use this app.');
     }
   }, []);
 
-  // Load COCO-SSD model
   useEffect(() => {
-    const loadModel = async () => {
-      try {
-        setIsLoading(true);
-
-        if (window.cocoSsd) {
-          const loadedModel = await window.cocoSsd.load();
-          setModel(loadedModel);
-          await initCamera();
-          setIsLoading(false);
-        } else {
-          setTimeout(() => {
-            if (window.cocoSsd) {
-              loadModel();
-            } else {
-              setError('TensorFlow.js COCO-SSD failed to load. Please refresh the page.');
-            }
-          }, 1000);
-        }
-      } catch (err) {
-        setError('Failed to initialize the detection system. Please refresh the page.');
-        console.error('Model loading error:', err);
+    const checkForLibs = () => {
+      if (window.tf && window.cocoSsd) {
+        loadAndInit();
+      } else {
+        setLoadingMessage('Loading AI libraries...');
+        setTimeout(checkForLibs, 100); // Poll every 100ms
       }
     };
 
-    loadModel();
+    async function loadAndInit() {
+      try {
+        setLoadingMessage('Configuring AI backend...');
+        await window.tf.setBackend('cpu');
+
+        setLoadingMessage('Loading detection model...');
+        const loadedModel = await window.cocoSsd.load();
+        setModel(loadedModel);
+
+        await initCamera();
+
+      } catch (err) {
+        console.error("Initialization failed:", err);
+        setError("Failed to initialize AI model. Please refresh.");
+      } finally {
+        setIsLoading(false);
+      }
+    }
+
+    checkForLibs();
+
+    const videoEl = videoRef.current;
 
     return () => {
-      if (animationFrameId.current) {
-        cancelAnimationFrame(animationFrameId.current);
-      }
-      if (detectionIntervalRef.current) {
-        clearInterval(detectionIntervalRef.current);
-      }
-      if (videoRef.current?.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach(track => track.stop());
+      if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
+      if (videoEl?.srcObject) {
+        (videoEl.srcObject as MediaStream).getTracks().forEach(track => track.stop());
       }
     };
   }, [initCamera]);
 
-  // Capture snapshot
   const captureSnapshot = useCallback((): string => {
-    if (!canvasRef.current || !videoRef.current) return '';
-
-    const canvas = canvasRef.current;
+    if (!videoRef.current) return '';
+    const canvas = document.createElement('canvas');
     const video = videoRef.current;
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
-
     const ctx = canvas.getContext('2d');
     if (ctx) {
-      ctx.drawImage(video, 0, 0);
+      ctx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
       return canvas.toDataURL('image/jpeg', 0.8);
     }
     return '';
   }, []);
 
-  // Draw bounding boxes
-  const drawDetections = useCallback((predictions: DetectedObject[]) => {
-    if (!canvasRef.current || !videoRef.current) return;
+  const processNewDetection = useCallback(async (snapshot: string) => {
+    const newDetectionId = `${Date.now()}`;
+    const newHuman: DetectedHuman = {
+      id: newDetectionId,
+      timestamp: new Date().toLocaleTimeString(),
+      imageData: snapshot,
+      description: 'Processing...',
+      isProcessing: true,
+    };
 
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    const ctx = canvas.getContext('2d');
+    setDetectedHumans(prev => [newHuman, ...prev].slice(0, 50)); // Keep the list from growing indefinitely
 
-    if (!ctx) return;
+    const description = await generateClothingDescription(snapshot);
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    predictions.forEach((prediction, index) => {
-      const [x, y, width, height] = prediction.bbox;
-
-      // Animated glow effect
-      const hue = (index * 60) % 360;
-      ctx.shadowBlur = 20;
-      ctx.shadowColor = `hsla(${hue}, 100%, 50%, 0.8)`;
-
-      // Draw bounding box
-      ctx.strokeStyle = `hsla(${hue}, 100%, 50%, 0.9)`;
-      ctx.lineWidth = 3;
-      ctx.strokeRect(x, y, width, height);
-
-      // Draw label background
-      const label = `${prediction.class} ${(prediction.score * 100).toFixed(0)}%`;
-      ctx.font = 'bold 16px Inter, sans-serif';
-      const textWidth = ctx.measureText(label).width;
-
-      ctx.fillStyle = `hsla(${hue}, 100%, 50%, 0.9)`;
-      ctx.fillRect(x, y - 30, textWidth + 16, 28);
-
-      // Draw label text
-      ctx.fillStyle = '#000';
-      ctx.shadowBlur = 0;
-      ctx.fillText(label, x + 8, y - 10);
-    });
+    setDetectedHumans(prev =>
+      prev.map(h =>
+        h.id === newDetectionId ? { ...h, description, isProcessing: false } : h
+      )
+    );
   }, []);
 
-  // Main detection loop
   const detect = useCallback(async () => {
-    if (!model || !videoRef.current || !isDetecting) return;
-
-    try {
+    if (model && videoRef.current && videoRef.current.readyState >= 3) {
       const predictions: DetectedObject[] = await model.detect(videoRef.current);
+      const humanPrediction = predictions.find(p => p.class === 'person' && p.score > 0.65);
 
-      // Filter by confidence threshold
-      const filteredPredictions = predictions.filter(p => p.score > 0.5);
-
-      // Draw bounding boxes
-      drawDetections(filteredPredictions);
-
-      // Update current objects
-      const objectLabels = filteredPredictions.map(p => p.class);
-      setCurrentObjects(objectLabels);
-
-      // Check for new detections (cooldown: 10 seconds)
       const now = Date.now();
-      const newDetections: typeof filteredPredictions = [];
-
-      filteredPredictions.forEach(prediction => {
-        const lastTime = lastDetectionTime.current.get(prediction.class) || 0;
-        if (now - lastTime > 10000) { // 10 second cooldown
-          newDetections.push(prediction);
-          lastDetectionTime.current.set(prediction.class, now);
-        }
-      });
-
-      // Create snapshot for new detections
-      if (newDetections.length > 0) {
+      if (humanPrediction && (now - lastDetectionTime.current > 10000)) { // 10-second cooldown
+        lastDetectionTime.current = now;
         const snapshot = captureSnapshot();
-        const detectionData: Detection = {
-          id: `${now}-${Math.random()}`,
-          timestamp: now,
-          objects: newDetections.map(p => ({
-            label: p.class,
-            confidence: p.score,
-            bbox: p.bbox
-          })),
-          imageData: snapshot,
-          explanation: generateExplanation(newDetections.map(p => ({
-            label: p.class,
-            confidence: p.score
-          })))
-        };
-
-        setDetections(prev => [detectionData, ...prev]);
+        if (snapshot) processNewDetection(snapshot);
       }
-    } catch (err) {
-      console.error('Detection error:', err);
-    }
 
+      if (isLiveFeedVisible && canvasRef.current && videoRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) {
+              canvasRef.current.width = videoRef.current.videoWidth;
+              canvasRef.current.height = videoRef.current.videoHeight;
+              ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+              predictions.forEach(p => {
+                  ctx.strokeStyle = '#8A63D2';
+                  ctx.lineWidth = 2;
+                  ctx.strokeRect(...p.bbox);
+                  ctx.fillStyle = '#8A63D2';
+                  ctx.font = '16px Inter, sans-serif';
+                  ctx.fillText(`${p.class} (${(p.score * 100).toFixed(0)}%)`, p.bbox[0], p.bbox[1] > 10 ? p.bbox[1] - 5 : 10);
+              });
+          }
+      }
+    }
     animationFrameId.current = requestAnimationFrame(detect);
-  }, [model, isDetecting, drawDetections, captureSnapshot, generateExplanation]);
+  }, [model, captureSnapshot, processNewDetection, isLiveFeedVisible]);
 
-  // Start/stop detection
   useEffect(() => {
-    if (isDetecting && model) {
+    if (model && !error) {
       detect();
-    } else if (animationFrameId.current) {
-      cancelAnimationFrame(animationFrameId.current);
     }
-
     return () => {
-      if (animationFrameId.current) {
-        cancelAnimationFrame(animationFrameId.current);
-      }
+      if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
     };
-  }, [isDetecting, model, detect]);
+  }, [model, error, detect]);
 
-  // Auto-start detection when model is loaded
-  useEffect(() => {
-    if (model && !isLoading) {
-      setIsDetecting(true);
-    }
-  }, [model, isLoading]);
-
-  const formatTime = (timestamp: number) => {
-    return new Date(timestamp).toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    });
-  };
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-background flex flex-col items-center justify-center text-on-surface">
+        <Loader2 size={48} className="animate-spin text-primary mb-4" />
+        <h2 className="text-2xl font-semibold">Recognito</h2>
+        <p className="text-on-surface-variant">{loadingMessage}</p>
+      </div>
+    );
+  }
 
   if (error) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 flex items-center justify-center p-4">
-        <div className="bg-red-500/10 border border-red-500/50 rounded-2xl p-8 max-w-md backdrop-blur-xl">
-          <AlertCircle className="w-12 h-12 text-red-400 mb-4" />
-          <h2 className="text-2xl font-bold text-white mb-2">Error</h2>
-          <p className="text-red-200">{error}</p>
-        </div>
+      <div className="min-h-screen bg-background flex flex-col items-center justify-center text-on-surface p-6">
+        <AlertCircle size={48} className="text-red-500 mb-4" />
+        <h2 className="text-2xl font-semibold text-red-400">An Error Occurred</h2>
+        <p className="text-on-surface-variant text-center max-w-md">{error}</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-indigo-900 to-slate-900 text-white">
-      {/* Header */}
-      <header className="border-b border-white/10 backdrop-blur-xl bg-black/20 sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-gradient-to-br from-cyan-500 to-blue-600 rounded-xl">
-              <Camera className="w-6 h-6" />
-            </div>
-            <div>
-              <h1 className="text-2xl font-bold bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
-                AI Vision
-              </h1>
-              <p className="text-xs text-gray-400">Real-time Object Recognition</p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-4">
-            {isDetecting && (
-              <div className="flex items-center gap-2 px-4 py-2 bg-green-500/20 border border-green-500/50 rounded-full">
-                <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
-                <span className="text-sm font-medium text-green-300">Active</span>
-              </div>
-            )}
-            <button
-              onClick={() => setIsDetecting(!isDetecting)}
-              className="px-6 py-2 bg-gradient-to-r from-cyan-500 to-blue-600 rounded-full font-medium hover:shadow-lg hover:shadow-cyan-500/50 transition-all duration-300"
-            >
-              {isDetecting ? 'Pause' : 'Resume'}
-            </button>
+    <div className="min-h-screen bg-background font-sans">
+      <header className="border-b border-outline">
+        <div className="container mx-auto px-6 py-4 flex justify-between items-center">
+          <h1 className="text-2xl font-bold text-on-surface">Recognito</h1>
+          <div className="flex items-center gap-2 text-primary">
+            <CheckCircle2 size={18} />
+            <span className="text-sm font-medium">System Active</span>
           </div>
         </div>
       </header>
-
-      {/* Loading State */}
-      {isLoading && (
-        <div className="fixed inset-0 flex items-center justify-center bg-black/50 backdrop-blur-sm z-50">
-          <div className="text-center">
-            <Loader2 className="w-16 h-16 text-cyan-400 animate-spin mx-auto mb-4" />
-            <p className="text-xl font-medium">Initializing AI Vision System...</p>
-            <p className="text-gray-400 mt-2">Loading neural network models</p>
-          </div>
-        </div>
-      )}
-
-      {/* Main Content */}
-      <div className="max-w-7xl mx-auto p-4 lg:p-6">
-        <div className="grid lg:grid-cols-2 gap-6">
-          {/* Video Feed */}
-          <div className="space-y-4">
-            <div className="bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl p-6 shadow-2xl">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-xl font-bold flex items-center gap-2">
-                  <Zap className="w-5 h-5 text-cyan-400" />
-                  Live Detection Feed
-                </h2>
-                {currentObjects.length > 0 && (
-                  <span className="text-sm text-gray-400">
-                    {currentObjects.length} object{currentObjects.length !== 1 ? 's' : ''} detected
-                  </span>
-                )}
-              </div>
-
-              <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
-                <video
-                  ref={videoRef}
-                  className="w-full h-full object-cover"
-                  playsInline
-                  muted
-                />
-                <canvas
+      <main className="container mx-auto p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="lg:col-span-2 space-y-6">
+          <div className="bg-surface rounded-lg border border-outline p-6">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-semibold text-on-surface flex items-center gap-2">
+                <Eye size={20} />
+                Live Feed
+              </h2>
+              <button
+                onClick={() => setIsLiveFeedVisible(!isLiveFeedVisible)}
+                className="px-4 py-2 bg-primary text-white rounded-md font-medium hover:bg-opacity-90 transition-colors"
+              >
+                {isLiveFeedVisible ? 'Hide Feed' : 'Show Feed'}
+              </button>
+            </div>
+            <div className="aspect-video bg-black rounded border border-outline flex items-center justify-center relative">
+              <video
+                ref={videoRef}
+                className={`w-full h-full object-cover ${!isLiveFeedVisible && 'hidden'}`}
+                playsInline
+                muted
+              />
+              <canvas
                   ref={canvasRef}
-                  className="absolute inset-0 w-full h-full"
-                />
-              </div>
-
-              {/* Current Objects */}
-              {currentObjects.length > 0 && (
-                <div className="mt-4 flex flex-wrap gap-2">
-                  {[...new Set(currentObjects)].map((obj, idx) => (
-                    <span
-                      key={`${obj}-${idx}`}
-                      className="px-3 py-1 bg-cyan-500/20 border border-cyan-500/50 rounded-full text-sm font-medium text-cyan-300 animate-pulse"
-                    >
-                      {obj}
-                    </span>
-                  ))}
+                  className={`absolute top-0 left-0 w-full h-full ${!isLiveFeedVisible && 'hidden'}`}
+              />
+              {!isLiveFeedVisible && (
+                <div className="flex flex-col items-center justify-center text-on-surface-variant">
+                  <VideoOff size={48} className="mb-4" />
+                  <p>Live feed is hidden</p>
+                  <p className="text-sm">Detection is active in the background</p>
                 </div>
               )}
             </div>
           </div>
+        </div>
 
-          {/* Detection Dashboard */}
-          <div className="space-y-4">
-            <div className="bg-black/40 backdrop-blur-xl border border-white/10 rounded-2xl p-6 shadow-2xl">
-              <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
-                <Zap className="w-5 h-5 text-cyan-400" />
-                Detection History
-              </h2>
-
-              <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
-                {detections.length === 0 ? (
-                  <div className="text-center py-12 text-gray-400">
-                    <Camera className="w-12 h-12 mx-auto mb-3 opacity-50" />
-                    <p>No objects detected yet</p>
-                    <p className="text-sm mt-1">AI is actively scanning...</p>
-                  </div>
-                ) : (
-                  detections.map((detection, index) => (
-                    <div
-                      key={detection.id}
-                      className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 border border-white/10 rounded-xl p-4 hover:border-cyan-500/50 transition-all duration-300 animate-fadeIn"
-                      style={{ animationDelay: `${index * 50}ms` }}
-                    >
-                      <img
-                        src={detection.imageData}
-                        alt="Detection snapshot"
-                        className="w-full rounded-lg mb-3 border border-white/10"
-                      />
-
-                      <div className="space-y-2">
-                        <div className="flex items-center justify-between text-xs text-gray-400">
-                          <span>{formatTime(detection.timestamp)}</span>
-                          <span>{detection.objects.length} object{detection.objects.length !== 1 ? 's' : ''}</span>
-                        </div>
-
-                        <div className="flex flex-wrap gap-2">
-                          {detection.objects.map((obj, idx) => (
-                            <span
-                              key={idx}
-                              className="px-2 py-1 bg-cyan-500/20 border border-cyan-500/50 rounded-md text-xs font-medium text-cyan-300"
-                            >
-                              {obj.label} {(obj.confidence * 100).toFixed(0)}%
-                            </span>
-                          ))}
-                        </div>
-
-                        <p className="text-sm text-gray-300 leading-relaxed">
-                          {detection.explanation}
-                        </p>
-                      </div>
+        <div className="lg:col-span-1">
+          <div className="bg-surface rounded-lg border border-outline p-6">
+            <h2 className="text-xl font-semibold text-on-surface flex items-center gap-2 mb-4">
+              <Users size={20} />
+              Detected Humans
+            </h2>
+            <div className="space-y-4 max-h-[75vh] overflow-y-auto custom-scrollbar pr-2">
+              {detectedHumans.length === 0 ? (
+                <div className="text-center py-12 text-on-surface-variant">
+                  <Users size={32} className="mx-auto mb-2" />
+                  <p>No humans detected yet.</p>
+                  <p className="text-sm">System is actively scanning...</p>
+                </div>
+              ) : (
+                detectedHumans.map((human) => (
+                  <div key={human.id} className="bg-background rounded-lg border border-outline p-4 animate-fade-in">
+                    <img
+                      src={human.imageData}
+                      alt={`Detection at ${human.timestamp}`}
+                      className="w-full rounded-md mb-3 border border-outline"
+                    />
+                    <div className="flex justify-between items-center text-xs text-on-surface-variant mb-2">
+                      <span>ID: {human.id}</span>
+                      <span>{human.timestamp}</span>
                     </div>
-                  ))
-                )}
-              </div>
+                    <div className="text-sm text-on-surface leading-relaxed">
+                      {human.isProcessing ? (
+                        <div className="flex items-center gap-2 text-on-surface-variant">
+                          <Loader2 size={16} className="animate-spin" />
+                          <span>Generating description...</span>
+                        </div>
+                      ) : (
+                        <p>{human.description}</p>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
             </div>
           </div>
         </div>
-      </div>
-
+      </main>
       <style>{`
-        @keyframes fadeIn {
-          from {
-            opacity: 0;
-            transform: translateY(10px);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0);
-          }
+        @keyframes fade-in {
+          from { opacity: 0; transform: translateY(10px); }
+          to { opacity: 1; transform: translateY(0); }
         }
-
-        .animate-fadeIn {
-          animation: fadeIn 0.5s ease-out forwards;
-        }
-
-        .custom-scrollbar::-webkit-scrollbar {
-          width: 8px;
-        }
-
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: rgba(0, 0, 0, 0.2);
-          border-radius: 4px;
-        }
-
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: rgba(6, 182, 212, 0.3);
-          border-radius: 4px;
-        }
-
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: rgba(6, 182, 212, 0.5);
+        .animate-fade-in {
+          animation: fade-in 0.5s ease-out forwards;
         }
       `}</style>
     </div>
